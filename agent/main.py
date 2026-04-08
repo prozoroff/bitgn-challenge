@@ -26,7 +26,7 @@ load_dotenv()
 
 BITGN_URL = os.getenv("BENCHMARK_HOST", "https://api.bitgn.com")
 BENCHMARK_ID = os.getenv("BENCHMARK_ID", "bitgn/pac1-dev")
-MODEL = os.getenv("MODEL", "claude-sonnet-4-6-20250514")
+MODEL = os.getenv("MODEL", "gpt-4o")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "40"))
 
 G = "\x1B[32m"

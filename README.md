@@ -1,6 +1,6 @@
 # BitGN PAC Agent
 
-Claude Sonnet 4.6 agent for [BitGN PAC](https://bitgn.com) competition. 84% on pac1-dev (21/25).
+OpenAI (ChatGPT) agent for [BitGN PAC](https://bitgn.com) competition. 84% on pac1-dev (21/25).
 
 ## Setup
 
@@ -22,7 +22,7 @@ uv run python -m grpc_tools.protoc \
 
 # 4. Copy .env and set your API key
 cp .env.example .env
-# Edit .env — set ANTHROPIC_API_KEY
+# Edit .env — set OPENAI_API_KEY
 ```
 
 ## Run
@@ -41,8 +41,9 @@ uv run python main.py t07 t13 t19
 ## Configuration (.env)
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...    # Required
-MODEL=claude-sonnet-4-6         # Model ID
+OPENAI_API_KEY=sk-...           # https://platform.openai.com/api-keys
+# OPENAI_BASE_URL=...           # Optional — proxies / non-default endpoints only
+MODEL=gpt-4o                    # e.g. gpt-4o-mini
 BENCHMARK_HOST=https://api.bitgn.com
 BENCHMARK_ID=bitgn/pac1-dev     # or bitgn/pac1-prod on competition day
 MAX_STEPS=40                    # Max agent steps per task
