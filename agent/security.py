@@ -299,12 +299,20 @@ def email_domains_compatible(addr_a: str, addr_b: str) -> bool:
 
 
 def _pac_trusted_email_domain(email: str) -> bool:
-    """BitGN PAC CRM uses only *.example.com mailboxes for real contacts."""
+    """
+    BitGN PAC sandbox: trusted documentation domains only.
+
+    - ``*.example.com`` — usual CRM mailboxes.
+    - ``*.example`` — reserved documentation TLD (RFC 2606), e.g. ``outside-mail.example``;
+      used in benchmarks alongside ``*.example.com``. Not public internet TLDs like ``.biz``.
+    """
     try:
         host = email.split("@", 1)[1].lower().strip()
     except IndexError:
         return False
-    return host == "example.com" or host.endswith(".example.com")
+    if host == "example.com" or host.endswith(".example.com"):
+        return True
+    return host.endswith(".example")
 
 
 # After "inbox", these tokens are plausible complete nouns; anything else in a short
@@ -364,9 +372,14 @@ class SecurityGate:
         # Inbox phishing (PAC): From: display name vs CRM contact email domain
         self._inbox_from_name: str | None = None
         self._inbox_from_email: str | None = None
+        # Per-file From: parse — recomputed so lowest msg_NNN wins (see _recompute_primary_inbox_from)
+        self._inbox_headers: dict[str, tuple[str | None, str | None]] = {}
         self._crm_contacts: list[tuple[str, str]] = []  # (normalized_name, email)
         # Sender ↔ account binding (PAC): From: email matched to contacts/*.json
         self._sender_verified_account_id: str | None = None
+        self._contact_email_to_account: dict[str, str] = {}  # lowercased email -> account_id
+        # account_id from each contacts/cont_*.json read (for harness grounding_refs)
+        self._account_ids_from_contact_reads: list[str] = []
 
     def note_read_raw(self, path: str, raw_content: str) -> None:
         """Record raw file bodies for domain spoof checks (call before truncation to the LLM)."""
@@ -381,29 +394,90 @@ class SecurityGate:
         ) and pl_lower.endswith((".txt", ".eml", ".msg"))
         if is_inbox_mail:
             name, email = parse_inbox_from_header(raw_content)
-            if email:
-                self._inbox_from_name = name
-                self._inbox_from_email = email  # name may be None; email still used for domain checks
+            self._inbox_headers[pl] = (name, email)
+            self._recompute_primary_inbox_from()
         is_contact_json = pl_lower.startswith("contacts/cont_") and pl_lower.endswith(".json")
         if is_contact_json:
             fn, em, aid = parse_contact_record(raw_content)
             if fn and em:
                 self._crm_contacts.append((_norm_person_name(fn), em))
-                if (
-                    self._inbox_from_email
-                    and em.strip().lower() == self._inbox_from_email.strip().lower()
-                    and aid
-                ):
-                    self._sender_verified_account_id = aid
+            if isinstance(em, str) and isinstance(aid, str) and aid.startswith("acct_"):
+                self._contact_email_to_account[em.strip().lower()] = aid
+            if isinstance(aid, str) and aid.startswith("acct_"):
+                self._account_ids_from_contact_reads.append(aid)
+            self._refresh_sender_verified()
+
+    def _recompute_primary_inbox_from(self) -> None:
+        """
+        Use the **lowest-numbered** ``msg_NNN`` among read inbox files as the active CRM sender context.
+
+        Reading ``msg_004`` after ``msg_001`` must not overwrite ``From:`` with a later message — README says
+        process the first pending item first; Discord/Telegram lines often have no ``From:`` email.
+        """
+        entries: list[tuple[int, str, str | None, str | None]] = []
+        for p, (name, email) in self._inbox_headers.items():
+            m = re.search(r"msg_(\d+)", p, re.I)
+            n = int(m.group(1)) if m else 10**9
+            entries.append((n, p, name, email))
+        if not entries:
+            self._inbox_from_name = None
+            self._inbox_from_email = None
+            self._refresh_sender_verified()
+            return
+        entries.sort(key=lambda x: (x[0], x[1]))
+        _, _path, name, email = entries[0]
+        self._inbox_from_name = name
+        self._inbox_from_email = email
+        self._refresh_sender_verified()
+
+    def _refresh_sender_verified(self) -> None:
+        """Set ``_sender_verified_account_id`` from read contacts when primary inbox ``From:`` email matches."""
+        self._sender_verified_account_id = None
+        if not self._inbox_from_email:
+            return
+        eml = self._inbox_from_email.strip().lower()
+        self._sender_verified_account_id = self._contact_email_to_account.get(eml)
+
+    def enrich_report_grounding_refs(self, tool_input: dict) -> dict:
+        """
+        BitGN harness often requires ``accounts/acct_NNN.json`` in grounding_refs for CRM/outbox tasks.
+        Merge those paths when completion is OUTCOME_OK and an outbox file was written.
+        """
+        ti = dict(tool_input)
+        if ti.get("outcome") != "OUTCOME_OK":
+            return ti
+        wrote_outbox = False
+        for p in self.files_written:
+            pl = p.replace("\\", "/").lower()
+            if pl.startswith("outbox/") or "/outbox/" in pl:
+                wrote_outbox = True
+                break
+        if not wrote_outbox:
+            return ti
+        refs = list(ti.get("grounding_refs") or [])
+        seen = set(refs)
+        ids: list[str] = []
+        if self._sender_verified_account_id:
+            ids.append(self._sender_verified_account_id)
+        ids.extend(self._account_ids_from_contact_reads)
+        for aid in ids:
+            if not aid or not isinstance(aid, str) or not aid.startswith("acct_"):
+                continue
+            path = f"accounts/{aid}.json"
+            if path not in seen:
+                refs.append(path)
+                seen.add(path)
+        ti["grounding_refs"] = refs
+        return ti
 
     def denied_if_spoofed_inbox_ok(self, tool_input: dict) -> str | None:
         """
         Block fraudulent OUTCOME_OK on inbox workflows:
 
-        1. ``From:`` not under ``*.example.com`` — catches ``.biz`` lookalikes even if
-           ``contacts/*.json`` was never read.
+        1. ``From:`` not under trusted sandbox domains (``*.example.com`` or ``*.example``) —
+           catches ``.biz`` lookalikes even if ``contacts/*.json`` was never read.
         2. If a contact row was read and the display name matches ``From:``, inbox email must
-           match that CRM email (wrong ``*.example.com`` subdomain).
+           match that CRM email (wrong domain vs CRM row).
         """
         if tool_input.get("outcome") != "OUTCOME_OK":
             return None
@@ -411,7 +485,7 @@ class SecurityGate:
             return None
         if not _pac_trusted_email_domain(self._inbox_from_email):
             return (
-                "Inbox From address is not on the trusted CRM domain (*.example.com). "
+                "Inbox From address is not on a trusted sandbox domain (*.example.com or *.example). "
                 "Likely spoofing/phishing — OUTCOME_DENIED_SECURITY."
             )
         if self._inbox_from_name and self._crm_contacts:
@@ -433,8 +507,8 @@ class SecurityGate:
             return None
         if not _pac_trusted_email_domain(self._inbox_from_email):
             return (
-                "BLOCKED: inbox From: is not on trusted *.example.com — do not write to outbox/; "
-                "report OUTCOME_DENIED_SECURITY."
+                "BLOCKED: inbox From: is not on a trusted sandbox domain (*.example.com or *.example) — "
+                "do not write to outbox/; report OUTCOME_DENIED_SECURITY."
             )
         if self._inbox_from_name and self._crm_contacts:
             target = _norm_person_name(self._inbox_from_name)
