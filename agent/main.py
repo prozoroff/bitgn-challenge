@@ -6,27 +6,32 @@ Connects to BitGN API, iterates tasks, runs agent, collects scores.
 import os
 import sys
 import textwrap
+from pathlib import Path
 
 from dotenv import load_dotenv
+
+# Явный путь к .env рядом с main.py; override=True — иначе пустой BITGN_API_KEY в окружении
+# перекрывает значение из файла (поведение python-dotenv по умолчанию).
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import (
     EndTrialRequest,
     EvalPolicy,
     GetBenchmarkRequest,
-    StartPlaygroundRequest,
     StartRunRequest,
     StartTrialRequest,
     StatusRequest,
+    SubmitRunRequest,
 )
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
 
-load_dotenv()
-
 BITGN_URL = os.getenv("BITGN_HOST") or os.getenv("BENCHMARK_HOST", "https://api.bitgn.com")
-BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
+BITGN_API_KEY = (os.getenv("BITGN_API_KEY") or "").strip()
 BENCHMARK_ID = os.getenv("BENCHMARK_ID", "bitgn/pac1-dev")
+RUN_NAME = os.getenv("RUN_NAME", "PAC1 prozorov")
 MODEL = os.getenv("MODEL", "gpt-4o")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "60"))
 
@@ -42,8 +47,15 @@ def main() -> None:
 
     scores: list[tuple[str, float]] = []
 
+    if not BITGN_API_KEY:
+        print(
+            f"{R}Нет BITGN_API_KEY: добавьте в agent/.env или экспортируйте ключ из профиля BitGN. "
+            f"Если в shell задан пустой export, удалите его — иначе он мешал подхвату из .env.{C}"
+        )
+        sys.exit(1)
+
     try:
-        client = HarnessServiceClientSync(BITGN_URL, api_key=BITGN_API_KEY or None)
+        client = HarnessServiceClientSync(BITGN_URL, api_key=BITGN_API_KEY)
         status = client.status(StatusRequest())
         print(f"Connected to BitGN: {status.status} v{status.version}")
 
@@ -54,43 +66,50 @@ def main() -> None:
             f"with {len(res.tasks)} tasks.\n{G}{res.description}{C}"
         )
 
-        for task in res.tasks:
-            if task_filter and task.task_id not in task_filter:
-                continue
-
-            print(f"\n{'=' * 60}")
-            print(f"TASK: {task.task_id}")
-            print(f"{'=' * 60}")
-
-            trial = client.start_playground(
-                StartPlaygroundRequest(
-                    benchmark_id=BENCHMARK_ID,
-                    task_id=task.task_id,
-                )
+        run = client.start_run(
+            StartRunRequest(
+                name=RUN_NAME,
+                benchmark_id=BENCHMARK_ID,
+                api_key=BITGN_API_KEY,
             )
+        )
 
-            print(f"{B}{trial.instruction}{C}")
-            print(f"{'-' * 60}")
+        try:
+            for trial_id in run.trial_ids:
+                trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
 
-            try:
-                run_agent(
-                    harness_url=trial.harness_url,
-                    task_text=trial.instruction,
-                    model=MODEL,
-                    max_steps=MAX_STEPS,
-                )
-            except Exception as exc:
-                print(f"{R}AGENT ERROR{C}: {exc}")
+                if task_filter and trial.task_id not in task_filter:
+                    continue
 
-            result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+                print(f"\n{'=' * 60}")
+                print(f"TASK: {trial.task_id}")
+                print(f"{'=' * 60}")
 
-            if result.score is not None and result.score >= 0:
-                scores.append((task.task_id, result.score))
-                style = G if result.score == 1 else R
-                explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                print(f"\n{style}Score: {result.score:0.2f}{C}")
-                if explain.strip():
-                    print(explain)
+                print(f"{B}{trial.instruction}{C}")
+                print(f"{'-' * 60}")
+
+                try:
+                    run_agent(
+                        harness_url=trial.harness_url,
+                        task_text=trial.instruction,
+                        model=MODEL,
+                        max_steps=MAX_STEPS,
+                    )
+                except Exception as exc:
+                    print(f"{R}AGENT ERROR{C}: {exc}")
+
+                result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+
+                if result.score is not None and result.score >= 0:
+                    scores.append((trial.task_id, result.score))
+                    style = G if result.score == 1 else R
+                    explain = textwrap.indent("\n".join(result.score_detail), "  ")
+                    print(f"\n{style}Score: {result.score:0.2f}{C}")
+                    if explain.strip():
+                        print(explain)
+
+        finally:
+            client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
 
     except ConnectError as exc:
         print(f"{R}{exc.code}: {exc.message}{C}")
