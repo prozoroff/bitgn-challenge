@@ -1,6 +1,6 @@
 # BitGN PAC Agent
 
-OpenAI (ChatGPT) agent for [BitGN PAC](https://bitgn.com) competition. 100% on pac1-dev (34/34).
+OpenAI (ChatGPT) agent for [BitGN PAC](https://bitgn.com) competition. 100% on pac1-dev (43/43).
 
 ## Setup
 
