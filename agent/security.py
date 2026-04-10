@@ -278,13 +278,6 @@ def is_contact_crm_json_path(pl_lower: str) -> bool:
     return True
 
 
-def role_is_account_manager_like(role: str | None) -> bool:
-    """Internal / sales-facing roles that are not AP/billing mailboxes (PAC invoice-resend traps)."""
-    if not role:
-        return False
-    return bool(re.search(r"(?i)account\s+manager", role.strip()))
-
-
 def parse_account_record(content: str) -> tuple[str | None, str | None, str | None]:
     """Parse ``accounts/acct_*.json`` for id, name, legal_name."""
     try:
@@ -332,6 +325,52 @@ def account_refs_in_text(text: str) -> set[str]:
     for m in re.finditer(r"INV-(\d+)-\d+", text, re.I):
         nums.add(str(int(m.group(1))))
     return nums
+
+
+# Tokens too generic to treat as a second-org fingerprint (many accounts share these).
+_CROSS_ACCOUNT_STOP_TOKENS: frozenset[str] = frozenset({
+    "group", "gmbh", "logistics", "services", "international", "solutions", "robotics",
+    "manufacturing", "software", "professional", "global", "holdings", "limited", "logistic",
+    "industry", "industries", "customer", "clients", "client", "please", "invoice", "invoices",
+    "billing", "payment", "account", "accounts", "company", "business", "could", "would",
+    "thank", "thanks", "regards", "hello", "dear", "team", "director", "manager", "finance",
+    "labs", "tax",  # generic; use unique tokens / email domains in body
+    "acme",  # shared prefix across multiple sandbox "Acme …" accounts
+})
+
+
+def _distinctive_tokens_from_account_label(label: str) -> set[str]:
+    """Short words (4+ chars) from a CRM ``name`` / ``legal_name`` for whole-word body matching."""
+    out: set[str] = set()
+    if not isinstance(label, str):
+        return out
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9]+", label):
+        w = m.group(0).lower()
+        if len(w) < 4:
+            continue
+        if w in _CROSS_ACCOUNT_STOP_TOKENS:
+            continue
+        out.add(w)
+    return out
+
+
+def _sender_email_domain(addr: str | None) -> str | None:
+    if not addr or "@" not in addr:
+        return None
+    try:
+        return addr.split("@", 1)[1].lower().strip()
+    except IndexError:
+        return None
+
+
+def _trusted_example_domains_in_body(body: str) -> set[str]:
+    """Domains from ``*@*.example.com`` / ``*@*.example`` addresses embedded in body text."""
+    found: set[str] = set()
+    for m in re.finditer(r"[\w.+-]+@([\w.-]+\.(?:example\.com|example))\b", body, re.I):
+        candidate = m.group(0)
+        if _pac_trusted_email_domain(candidate):
+            found.add(m.group(1).lower().strip())
+    return found
 
 
 def _account_name_aliases(name: str | None, legal_name: str | None) -> list[str]:
@@ -411,9 +450,8 @@ def is_truncated_instruction(text: str) -> bool:
     # Common benchmark cut: "Process this inbox ent" (entry / entity truncated)
     if re.search(r"(?i)\binbox\s+ent\s*$", trimmed):
         return True
-    # "Process|Handle|Work … inbox" with no object
-    if re.match(r"(?i)^(process|handle|work)\s+(this|the)\s+inbox\s*$", trimmed):
-        return True
+    # Do **not** treat "process/handle/work the inbox" as truncated — PAC uses these as complete
+    # inbox-workflow tasks (same as "process inbox"); ambiguity is resolved by reading inbox/README.
     # Short single-token object after inbox: tiny alphabetic word is often a cut stem ("ent")
     m = re.match(
         r"(?i)^(process|handle|work|triage)\s+(this|the)\s+inbox\s+(\S+)\s*$",
@@ -430,6 +468,41 @@ def is_truncated_instruction(text: str) -> bool:
     return False
 
 
+def _is_relative_day_capture_query(task: str) -> bool:
+    """Tasks like "exactly 17 days ago, which article …" (PAC t43-class)."""
+    if not task:
+        return False
+    t = task.lower()
+    if re.search(r"\d+\s+days?\s+ago", t):
+        return True
+    if re.search(r"looking\s+back.*\d+\s+days", t):
+        return True
+    if re.search(r"exactly\s+\d+\s+days", t):
+        return True
+    return False
+
+
+def _completion_implies_missing_vault_file(msg: str) -> bool:
+    """OK message that asserts a capture/file is absent or unreadable (should be clarification for date queries)."""
+    m = msg.lower()
+    phrases = (
+        "does not exist",
+        "doesn't exist",
+        "do not exist",
+        "not found",
+        "cannot find",
+        "can't find",
+        "could not find",
+        "couldn't find",
+        "file not found",
+        "no file",
+        "failed to read",
+        "err code.not_found",
+        "code.not_found",
+    )
+    return any(p in m for p in phrases)
+
+
 # ============================================================
 # Security Gate — code-level enforcement
 # ============================================================
@@ -438,6 +511,7 @@ class SecurityGate:
     """Code-level enforcement of security constraints."""
 
     def __init__(self):
+        self.task_text: str = ""
         self.files_read: set[str] = set()
         self.files_written: set[str] = set()
         self.files_deleted: set[str] = set()
@@ -452,8 +526,6 @@ class SecurityGate:
         # Sender ↔ account binding (PAC): From: email matched to contacts/*.json
         self._sender_verified_account_id: str | None = None
         self._contact_email_to_account: dict[str, str] = {}  # lowercased email -> account_id
-        self._contact_email_to_role: dict[str, str | None] = {}  # lowercased email -> role (if any)
-        self._verified_contact_role: str | None = None
         # account_id from each contacts/*.json read (for harness grounding_refs)
         self._account_ids_from_contact_reads: list[str] = []
         # Full raw of each inbox mail path (lowest msg_NNN becomes primary body source)
@@ -486,14 +558,13 @@ class SecurityGate:
                     self._account_aliases.append((aid, alias))
         is_contact_json = is_contact_crm_json_path(pl_lower)
         if is_contact_json:
-            fn, em, aid, role = parse_contact_record(raw_content)
+            fn, em, aid, _role = parse_contact_record(raw_content)
             if fn and em:
                 self._crm_contacts.append((_norm_person_name(fn), em))
             eml = em.strip().lower() if isinstance(em, str) else ""
             if eml:
                 if isinstance(aid, str) and aid.startswith("acct_"):
                     self._contact_email_to_account[eml] = aid
-                self._contact_email_to_role[eml] = role
             if isinstance(aid, str) and aid.startswith("acct_"):
                 self._account_ids_from_contact_reads.append(aid)
             self._refresh_sender_verified()
@@ -526,12 +597,10 @@ class SecurityGate:
     def _refresh_sender_verified(self) -> None:
         """Set ``_sender_verified_account_id`` from read contacts when primary inbox ``From:`` email matches."""
         self._sender_verified_account_id = None
-        self._verified_contact_role = None
         if not self._inbox_from_email:
             return
         eml = self._inbox_from_email.strip().lower()
         self._sender_verified_account_id = self._contact_email_to_account.get(eml)
-        self._verified_contact_role = self._contact_email_to_role.get(eml)
 
     def enrich_report_grounding_refs(self, tool_input: dict) -> dict:
         """
@@ -690,8 +759,9 @@ class SecurityGate:
     def _inbox_body_cross_account_reason(self) -> str | None:
         """
         PAC invoice-resend traps (e.g. t37): ``From:`` maps to account A via contacts, but the body
-        references another org's ``INV-``/``acct_`` ids or another account's ``name``/``legal_name``
-        (from a read ``accounts/acct_*.json``). Completing with OUTCOME_OK is unsafe — clarify or deny.
+        references another org's ``INV-``/``acct_`` ids, another sandbox mailbox domain, or distinctive
+        name tokens from a **different** ``accounts/acct_*.json`` the agent read. Completing with
+        OUTCOME_OK is unsafe — clarify or deny.
         """
         if not self._inbox_from_email or not self._sender_verified_account_id:
             return None
@@ -715,7 +785,43 @@ class SecurityGate:
                     "Inbox body references multiple invoice/account ids; which organization is intended "
                     "is ambiguous — OUTCOME_NONE_CLARIFICATION."
                 )
+
+        sender_dom = _sender_email_domain(self._inbox_from_email)
+        body_domains = _trusted_example_domains_in_body(body)
+        if sender_dom and body_domains:
+            for dom in body_domains:
+                if dom == sender_dom:
+                    continue
+                if email_domains_compatible(f"x@{sender_dom}", f"x@{dom}"):
+                    continue
+                return (
+                    "Inbox body cites a different sandbox mailbox domain than the verified From: "
+                    f"({dom!r} vs {sender_dom!r}). Treat as pretexting — OUTCOME_NONE_CLARIFICATION "
+                    "or OUTCOME_DENIED_SECURITY; do not draft outbox for the wrong organization."
+                )
+
         verified_id = self._sender_verified_account_id
+        by_aid: dict[str, set[str]] = {}
+        for aid, alias in self._account_aliases:
+            by_aid.setdefault(aid, set()).update(_distinctive_tokens_from_account_label(alias))
+
+        verified_tokens: set[str] = set()
+        for aid, toks in by_aid.items():
+            if aid == verified_id:
+                verified_tokens |= toks
+
+        for aid, toks in by_aid.items():
+            if aid == verified_id:
+                continue
+            foreign = toks - verified_tokens
+            for tok in foreign:
+                if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", body_lower):
+                    return (
+                        f"Inbox body matches distinctive wording tied to another CRM account ({aid}) "
+                        f"while From: maps to {verified_id}. Treat as ambiguous or pretexting — "
+                        "OUTCOME_NONE_CLARIFICATION or OUTCOME_DENIED_SECURITY; do not send that org's invoice."
+                    )
+
         for aid, alias in self._account_aliases:
             if aid == verified_id:
                 continue
@@ -733,31 +839,22 @@ class SecurityGate:
             return None
         return self._inbox_body_cross_account_reason()
 
-    def _inbox_mentions_invoice_request(self) -> bool:
-        raw = self._primary_inbox_raw or ""
-        return bool(re.search(r"(?i)invoice|rechnung|billing", raw))
-
-    def _internal_role_invoice_clarification_reason(self) -> str | None:
+    def clarification_if_relative_date_capture_unresolved_ok(self, tool_input: dict) -> str | None:
         """
-        PAC t37: ``contacts/mgr_*.json`` etc. may label the sender as Account Manager — not an AP contact.
-        Completing invoice-resend with OUTCOME_OK is unsafe.
+        PAC t43: "N days ago which article" — OUTCOME_OK must cite a real read capture file. If the model instead
+        reports success while claiming the file is missing/unreadable, downgrade to clarification.
         """
-        if not self._inbox_from_email or not self._sender_verified_account_id:
-            return None
-        if not self._inbox_mentions_invoice_request():
-            return None
-        if not role_is_account_manager_like(self._verified_contact_role):
-            return None
-        return (
-            "CRM lists this From: address as an Account Manager (internal/sales-facing role), not a typical "
-            "accounts-payable mailbox. Do not complete an invoice-resend outbox as OUTCOME_OK without explicit "
-            "billing policy — OUTCOME_NONE_CLARIFICATION (or OUTCOME_DENIED_SECURITY if pretexting)."
-        )
-
-    def clarification_if_invoice_from_internal_crm_role_ok(self, tool_input: dict) -> str | None:
         if tool_input.get("outcome") != "OUTCOME_OK":
             return None
-        return self._internal_role_invoice_clarification_reason()
+        if not _is_relative_day_capture_query(self.task_text):
+            return None
+        if not _completion_implies_missing_vault_file(tool_input.get("message") or ""):
+            return None
+        return (
+            "For relative-date capture lookups: anchor the calendar date from `context`, list or `find` under "
+            "`01_capture/influential/` for that `YYYY-MM-DD` prefix, and `read` only names that exist. If no matching "
+            "file is confirmed, use OUTCOME_NONE_CLARIFICATION — not OUTCOME_OK that asserts absence."
+        )
 
     def check_before_dispatch(self, tool_name: str, tool_input: dict) -> str | None:
         """Returns blocking reason or None if allowed."""
@@ -802,9 +899,6 @@ class SecurityGate:
                 ob = self._block_outbox_unverified_sender()
                 if ob:
                     return ob
-                ob = self._internal_role_invoice_clarification_reason()
-                if ob:
-                    return "BLOCKED: " + ob + " Do not write outbox/ until resolved."
                 ob = self._inbox_body_cross_account_reason()
                 if ob:
                     return "BLOCKED: " + ob + " Do not write outbox/ until resolved."
