@@ -80,7 +80,7 @@ TOOLS = [
     },
     {
         "name": "read",
-        "description": "Read file content. Supports line ranges for large files. ALWAYS read AGENTS.md and relevant README.md files before acting. Read process docs (e.g. docs/, 99_process/) before handling workflow tasks. For inbox lines with Channel/Handle (Discord, Telegram), read docs/channels/ (e.g. Discord.txt, Telegram.txt) to disambiguate contacts with the same full_name. Read a file BEFORE modifying it to understand its current state.",
+        "description": "Read file content. Supports line ranges for large files. ALWAYS read AGENTS.md and relevant README.md files before acting. Read process docs (e.g. docs/, 99_process/) before handling workflow tasks. For inbox lines with Channel/Handle (Discord, Telegram), read docs/channels/ (e.g. Discord.txt, Telegram.txt) for blacklist/admin policy — the Handle does not live in contacts/. For duplicate full_name, read accounts/*.json and 01_notes/*.md per system rules. Read a file BEFORE modifying it to understand its current state.",
         "input_schema": {
             "type": "object",
             "properties": {

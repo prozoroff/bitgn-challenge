@@ -1,14 +1,35 @@
 """ConnectRPC sync client for HarnessService."""
 
+from __future__ import annotations
+
 from connectrpc.client import ConnectClientSync
+from connectrpc.interceptor import MetadataInterceptorSync
 from connectrpc.method import IdempotencyLevel, MethodInfo
+from connectrpc.request import RequestContext
 
 from bitgn import harness_pb2 as pb
 
 
+class _BitGnApiKeyInterceptor(MetadataInterceptorSync[None]):
+    """Adds BitGN API key to every Harness RPC (server may also accept api_key in newer protos)."""
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+
+    def on_start_sync(self, ctx: RequestContext) -> None:
+        ctx.request_headers()["authorization"] = f"Bearer {self._api_key}"
+        return None
+
+    def on_end_sync(
+        self, token: None, ctx: RequestContext, error: Exception | None
+    ) -> None:
+        return
+
+
 class HarnessServiceClientSync:
-    def __init__(self, address: str):
-        self._client = ConnectClientSync(address)
+    def __init__(self, address: str, *, api_key: str | None = None):
+        interceptors = (_BitGnApiKeyInterceptor(api_key),) if api_key else ()
+        self._client = ConnectClientSync(address, interceptors=interceptors)
 
     def _method(self, name, input_type, output_type):
         return MethodInfo(

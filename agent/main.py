@@ -24,7 +24,8 @@ from agent import run_agent
 
 load_dotenv()
 
-BITGN_URL = os.getenv("BENCHMARK_HOST", "https://api.bitgn.com")
+BITGN_URL = os.getenv("BITGN_HOST") or os.getenv("BENCHMARK_HOST", "https://api.bitgn.com")
+BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
 BENCHMARK_ID = os.getenv("BENCHMARK_ID", "bitgn/pac1-dev")
 MODEL = os.getenv("MODEL", "gpt-4o")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "60"))
@@ -42,7 +43,7 @@ def main() -> None:
     scores: list[tuple[str, float]] = []
 
     try:
-        client = HarnessServiceClientSync(BITGN_URL)
+        client = HarnessServiceClientSync(BITGN_URL, api_key=BITGN_API_KEY or None)
         status = client.status(StatusRequest())
         print(f"Connected to BitGN: {status.status} v{status.version}")
 
