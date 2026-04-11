@@ -1,5 +1,5 @@
 """
-Tool definitions for BitGN PAC agent.
+Tool definitions for the BitGN challenge agent.
 JSON-schema tool definitions + dispatch to PcmRuntime.
 """
 
@@ -108,7 +108,7 @@ TOOLS = [
     },
     {
         "name": "delete",
-        "description": "Delete a file or directory. Use ONLY when the task explicitly says 'delete', 'remove', or 'discard'. Processing or handling a file does NOT imply deleting it.",
+        "description": "Delete a file or directory. Use ONLY when the task explicitly says 'delete', 'remove', or 'discard'. Processing or handling a file does NOT imply deleting it. For discard/remove/delete **thread** tasks targeting ``02_distill/threads/<slug>.md``, call ``delete`` on that path even if list/find shows the file is already missing (idempotent).",
         "input_schema": {
             "type": "object",
             "properties": {

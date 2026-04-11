@@ -1,5 +1,5 @@
 """
-BitGN PAC Harness Client.
+BitGN challenge harness client.
 Connects to BitGN API, iterates tasks, runs agent, collects scores.
 """
 
